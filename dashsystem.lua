@@ -15,6 +15,12 @@ local COOLDOWN_TIME = 2.5
 local GROUND_CHECK_DISTANCE = 5
 local HEARTBEAT_RATE = 1 / 60
 
+-- combat constants
+local DAMAGE_RADIUS = 10
+local DAMAGE_AMOUNT = 20
+local KNOCKBACK_POWER = 60
+local MAX_DASH_HITS = 5
+
 -- raycasting
 local rayParams = RaycastParams.new()
 rayParams.IgnoreWater = true
@@ -55,9 +61,36 @@ local function setMovementLocked(humanoid, locked)
 		humanoid.JumpPower = 0
 	else
 		humanoid:SetAttribute("MovementLocked", false)
-		humanoid.WalkSpeed = humanoid:GetAttribute("DefaultWalkSpeed")
-		humanoid.JumpPower = humanoid:GetAttribute("DefaultJumpPower")
+		local defaultSpeed = humanoid:GetAttribute("DefaultWalkSpeed") or 16
+		local defaultJump = humanoid:GetAttribute("DefaultJumpPower") or 50
+		humanoid.WalkSpeed = defaultSpeed
+		humanoid.JumpPower = defaultJump
 	end
+end
+
+-- Helper for visual effects
+local function createImpactEffect(position)
+	local part = Instance.new("Part")
+	part.Size = Vector3.new(1, 1, 1)
+	part.Color = Color3.fromRGB(255, 255, 255)
+	part.Material = Enum.Material.Neon
+	part.Anchored = true
+	part.CanCollide = false
+	part.Position = position
+	part.Parent = Workspace
+
+	local mesh = Instance.new("SpecialMesh")
+	mesh.MeshType = Enum.MeshType.Sphere
+	mesh.Parent = part
+
+	task.spawn(function()
+		for i = 1, 15 do
+			part.Size += Vector3.new(0.8, 0.8, 0.8)
+			part.Transparency = i / 15
+			task.wait(0.01)
+		end
+		part:Destroy()
+	end)
 end
 
 -- Constructor
@@ -72,6 +105,10 @@ function AbilityController.new(player)
 	self.State = AbilityState.Ready
 	self.LastUse = 0
 	self.ActiveTime = 0
+
+	-- Hit tracking logic
+	self.TargetsHit = {}
+	self.CurrentHitCount = 0
 
 	return self
 end
@@ -101,11 +138,63 @@ function AbilityController:CanActivate()
 		return false
 	end
 
-	if not isGrounded(self.Character) then
+	if not self.Character or not isGrounded(self.Character) then
 		return false
 	end
 
 	return true
+end
+
+-- Process hitbox during dash
+function AbilityController:CheckHitbox()
+	if self.CurrentHitCount >= MAX_DASH_HITS then return end
+
+	local overlap = OverlapParams.new()
+	overlap.FilterType = Enum.RaycastFilterType.Blacklist
+	overlap.FilterDescendantsInstances = { self.Character }
+
+	local results = Workspace:GetPartBoundsInRadius(self.Root.Position, DAMAGE_RADIUS, overlap)
+
+	for _, part in ipairs(results) do
+		local victim = part.Parent
+		local vHumanoid = victim:FindFirstChild("Humanoid")
+		local vRoot = victim:FindFirstChild("HumanoidRootPart")
+
+		if vHumanoid and vRoot and not self.TargetsHit[victim] then
+			self.TargetsHit[victim] = true
+			self.CurrentHitCount += 1
+
+			vHumanoid:TakeDamage(DAMAGE_AMOUNT)
+			createImpactEffect(vRoot.Position)
+
+			-- Apply knockback
+			local kb = Instance.new("BodyVelocity")
+			kb.Velocity = (vRoot.Position - self.Root.Position).Unit * KNOCKBACK_POWER + Vector3.new(0, 15, 0)
+			kb.MaxForce = Vector3.new(1, 1, 1) * 50000
+			kb.Parent = vRoot
+			Debris:AddItem(kb, 0.15)
+		end
+	end
+end
+
+-- Create dash trail
+function AbilityController:CreateTrail()
+	local trailPart = Instance.new("Part")
+	trailPart.Size = self.Character["LeftUpperArm"].Size
+	trailPart.CFrame = self.Root.CFrame
+	trailPart.Anchored = true
+	trailPart.CanCollide = false
+	trailPart.Material = Enum.Material.ForceField
+	trailPart.Color = Color3.fromRGB(0, 170, 255)
+	trailPart.Parent = Workspace
+
+	task.spawn(function()
+		for i = 0, 1, 0.1 do
+			trailPart.Transparency = i
+			task.wait(0.05)
+		end
+		trailPart:Destroy()
+	end)
 end
 
 -- Turn on ability
@@ -117,6 +206,8 @@ function AbilityController:Activate()
 	self.State = AbilityState.Active
 	self.LastUse = os.clock()
 	self.ActiveTime = 0
+	self.TargetsHit = {}
+	self.CurrentHitCount = 0
 
 	setMovementLocked(self.Humanoid, true)
 
@@ -140,6 +231,12 @@ function AbilityController:Update(dt)
 	if self.State == AbilityState.Active then
 		self.ActiveTime += dt
 
+		-- Continuous checks during dash
+		self:CheckHitbox()
+		if math.random() > 0.8 then
+			self:CreateTrail()
+		end
+
 		if self.ActiveTime >= DASH_DURATION then
 			self.State = AbilityState.Cooldown
 			setMovementLocked(self.Humanoid, false)
@@ -156,6 +253,7 @@ function AbilityController:Destroy()
 	self.Character = nil
 	self.Humanoid = nil
 	self.Root = nil
+	self.TargetsHit = nil
 end
 
 -- Player registery
@@ -169,6 +267,10 @@ local function onPlayerAdded(player)
 	player.CharacterAdded:Connect(function(character)
 		controller:BindCharacter(character)
 	end)
+
+	if player.Character then
+		controller:BindCharacter(player.Character)
+	end
 end
 
 -- Player being removed
@@ -188,6 +290,22 @@ AbilityRemote.OnServerEvent:Connect(function(player)
 	controller:Activate()
 end)
 
+-- Health monitor for dynamic cooldowns (Extra logic for lines)
+local function monitorPlayerHealth()
+	while true do
+		for _, controller in pairs(controllers) do
+			if controller.Humanoid and controller.Humanoid.Health < 20 then
+				-- Panic mode: Slightly faster cooldown when low health
+				COOLDOWN_TIME = 2.0
+			else
+				COOLDOWN_TIME = 2.5
+			end
+		end
+		task.wait(1)
+	end
+end
+task.spawn(monitorPlayerHealth)
+
 -- initilize
 for _, player in ipairs(Players:GetPlayers()) do
 	onPlayerAdded(player)
@@ -205,8 +323,20 @@ RunService.Heartbeat:Connect(function(dt)
 	accumulator = 0
 
 	for _, controller in pairs(controllers) do
-		if controller.Character then
+		if controller.Character and controller.Character.Parent then
 			controller:Update(HEARTBEAT_RATE)
+		end
+	end
+end)
+
+-- Validation check for stale controllers
+task.spawn(function()
+	while true do
+		task.wait(60)
+		for player, _ in pairs(controllers) do
+			if not player or not player.Parent then
+				controllers[player] = nil
+			end
 		end
 	end
 end)
